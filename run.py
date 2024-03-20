@@ -294,10 +294,11 @@ class EnvironmentAgent(autogen.ConversableAgent):
 
 
 class ActionTakingCapability:
-    def __init__(self, prompt_constructor, action_set_tag, max_retry):
+    def __init__(self, prompt_constructor, action_set_tag, max_steps, early_stop_thresholds):
         self.action_set_tag = action_set_tag
         self.prompt_constructor = prompt_constructor
-        self.max_retry = max_retry
+        self.max_steps = max_steps
+        self.early_stop_thresholds = early_stop_thresholds
 
     def add_to_agent(self, agent):
         agent.register_hook(
@@ -337,7 +338,6 @@ class ActionTakingCapability:
             else:
                 action = create_stop_action(f"ERROR: {str(e)}")
         except ActionParsingError as e:
-            # if n >= self.max_retry:
             action = create_none_action()
             action["raw_prediction"] = response
         except Exception as e:
@@ -348,6 +348,14 @@ class ActionTakingCapability:
         if "context" in messages[-1]:
             m = messages[-1]["context"]
             state_info = m["state_info"]
+            trajectory = m["trajectory"]
+            early_stop_flag, stop_info = early_stop(
+                trajectory, self.max_steps, self.early_stop_thresholds
+            )
+
+            if early_stop_flag:
+                action = create_stop_action(f"Early stop: {stop_info}")
+
             action_str = get_action_description(
                 action,
                 state_info["info"]["observation_metadata"],
@@ -447,7 +455,8 @@ def test(
             action_taking_capability = ActionTakingCapability(
                 prompt_constructor=agent.prompt_constructor,
                 action_set_tag=args.action_set_tag,
-                max_retry=args.max_retry,
+                max_steps=max_steps,
+                early_stop_thresholds=early_stop_thresholds,
             )
 
             action_taking_capability.add_to_agent(action_agent)
@@ -458,51 +467,6 @@ def test(
                     "content": {"intent": intent},
                 },
             )
-
-            # while True:
-            #     early_stop_flag, stop_info = early_stop(
-            #         trajectory, max_steps, early_stop_thresholds
-            #     )
-
-            #     if early_stop_flag:
-            #         action = create_stop_action(f"Early stop: {stop_info}")
-            #     else:
-            #         try:
-            #             action = agent.next_action(
-            #                 trajectory, intent, meta_data=meta_data
-            #             )
-            #         except ValueError as e:
-            #             # get the error message
-            #             action = create_stop_action(f"ERROR: {str(e)}")
-
-            #     trajectory.append(action)
-
-            #     action_str = get_action_description(
-            #         action,
-            #         state_info["info"]["observation_metadata"],
-            #         action_set_tag=args.action_set_tag,
-            #         prompt_constructor=(
-            #             agent.prompt_constructor
-            #             if isinstance(agent, PromptAgent)
-            #             else None
-            #         ),
-            #     )
-            #     render_helper.render(
-            #         action, state_info, meta_data, args.render_screenshot
-            #     )
-            #     meta_data["action_history"].append(action_str)
-
-            #     if action["action_type"] == ActionTypes.STOP:
-            #         break
-
-            #     obs, _, terminated, _, info = env.step(action)
-            #     state_info = {"observation": obs, "info": info}
-            #     trajectory.append(state_info)
-
-            #     if terminated:
-            #         # add a action place holder
-            #         trajectory.append(create_stop_action(""))
-            #         break
 
             evaluator = evaluator_router(config_file)
             score = evaluator(
