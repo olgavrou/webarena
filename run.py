@@ -1,4 +1,5 @@
 """Script to run end-to-end evaluation on the benchmark"""
+
 import argparse
 import glob
 import json
@@ -11,6 +12,7 @@ import time
 from pathlib import Path
 
 import openai
+import autogen
 
 from agent import (
     Agent,
@@ -18,6 +20,12 @@ from agent import (
     TeacherForcingAgent,
     construct_agent,
 )
+from browser_env.actions import (
+    create_none_action,
+    create_id_based_action,
+    create_playwright_action,
+)
+
 from agent.prompts import *
 from browser_env import (
     Action,
@@ -176,10 +184,7 @@ def early_stop(
     last_k_actions = trajectory[1::2][-k:]  # type: ignore[assignment]
     if len(last_k_actions) >= k:
         if all(
-            [
-                action["action_type"] == ActionTypes.NONE
-                for action in last_k_actions
-            ]
+            [action["action_type"] == ActionTypes.NONE for action in last_k_actions]
         ):
             return True, f"Failed to parse actions for {k} times"
 
@@ -195,23 +200,162 @@ def early_stop(
 
     if last_action["action_type"] != ActionTypes.TYPE:
         if len(last_k_actions) >= k:
-            if all(
-                [
-                    is_equivalent(action, last_action)
-                    for action in last_k_actions
-                ]
-            ):
+            if all([is_equivalent(action, last_action) for action in last_k_actions]):
                 return True, f"Same action for {k} times"
 
     else:
         # check the action sequence
-        if (
-            sum([is_equivalent(action, last_action) for action in action_seq])
-            >= k
-        ):
+        if sum([is_equivalent(action, last_action) for action in action_seq]) >= k:
             return True, f"Same typing action for {k} times"
 
     return False, ""
+
+
+class EnvironmentAgent(autogen.ConversableAgent):
+    def __init__(
+        self,
+        env,
+        config_file,
+        result_dir,
+        action_set_tag,
+        *args,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.env = env
+        self.trajectory: Trajectory = []
+        obs, info = env.reset(options={"config_file": config_file})
+        self.state_info: StateInfo = {"observation": obs, "info": info}
+        self.trajectory.append(self.state_info)
+        self.meta_data = {"action_history": ["None"]}
+        self.action_set_tag = action_set_tag
+        self.render_helper = RenderHelper(config_file, result_dir, action_set_tag)
+        self.register_reply(
+            [autogen.Agent, None], EnvironmentAgent.generate_env_reply, position=1
+        )
+        self.register_hook(
+            hookable_method="process_message_before_send",
+            hook=self.process_message_before_send,
+        )
+
+    def process_message_before_send(self, sender, message, recipient, silent):
+        if "context" in message:
+            raise ValueError("Message should not contain context freom generate_reply")
+
+        message["context"] = {
+            "trajectory": self.trajectory,
+            "meta_data": self.meta_data,
+            "state_info": self.state_info,
+        }
+
+        if "intent" in message["content"]:
+            intent = message["content"]["intent"]
+            obs = self.state_info["observation"]["text"]
+            message["content"] = f"{obs} \n\n {intent}"
+            message["context"]["intent"] = intent
+        return message
+
+    def generate_env_reply(
+        self,
+        messages=None,
+        sender=None,
+        config=None,
+    ):
+        if messages is None:
+            messages = self.chat_messages[sender]
+
+        action = messages[-1]["context"]
+        action_str = messages[-1]["content"]
+        self.trajectory.append(action)
+
+        action_str = get_action_description(
+            action,
+            self.state_info["info"]["observation_metadata"],
+            action_set_tag=args.action_set_tag,
+            prompt_constructor=(
+                agent.prompt_constructor if isinstance(agent, PromptAgent) else None
+            ),
+        )
+        self.render_helper.render(action, self.state_info, self.meta_data, True)
+        self.meta_data["action_history"].append(action_str)
+
+        if action["action_type"] == ActionTypes.STOP:
+            return True, {"content": "TERMINATE"}
+
+        obs, _, terminated, _, info = self.env.step(action)
+        self.state_info = {"observation": obs, "info": info}
+        self.trajectory.append(self.state_info)
+
+        if terminated:
+            self.trajectory.append(create_stop_action(""))
+            return True, "TERMINATE"
+
+        return True, {"content": obs["text"]}
+
+
+class ActionTakingCapability:
+    def __init__(self, prompt_constructor, action_set_tag, max_retry):
+        self.action_set_tag = action_set_tag
+        self.prompt_constructor = prompt_constructor
+        self.max_retry = max_retry
+
+    def add_to_agent(self, agent):
+        agent.register_hook(
+            hookable_method="process_all_messages_before_reply",
+            hook=self.process_all_messages_before_reply,
+        )
+        agent.register_hook(
+            hookable_method="process_message_before_send",
+            hook=self.process_message_before_send,
+        )
+
+    def process_all_messages_before_reply(self, messages):
+        if "context" in messages[-1]:
+            m = messages[-1]["context"]
+            trajectory = m["trajectory"]
+            meta_data = m["meta_data"]
+            intent = messages[0]["context"]["intent"]
+        else:
+            if "TERMINATE" in messages[-1]["content"]:
+                return messages
+
+        # take action
+        prompt = self.prompt_constructor.construct(trajectory, intent, meta_data)
+        return prompt
+
+    def process_message_before_send(self, sender, message, recipient, silent):
+        force_prefix = self.prompt_constructor.instruction["meta_data"].get(
+            "force_prefix", ""
+        )
+        response = f"{force_prefix}{message}"
+        try:
+            parsed_response = self.prompt_constructor.extract_action(response)
+            if self.action_set_tag == "id_accessibility_tree":
+                action = create_id_based_action(parsed_response)
+            elif self.action_set_tag == "playwright":
+                action = create_playwright_action(parsed_response)
+            else:
+                action = create_stop_action(f"ERROR: {str(e)}")
+        except ActionParsingError as e:
+            # if n >= self.max_retry:
+            action = create_none_action()
+            action["raw_prediction"] = response
+        except Exception as e:
+            action = create_stop_action(f"ERROR: {str(e)}")
+            action["raw_prediction"] = response
+
+        messages = sender.chat_messages[recipient]
+        if "context" in messages[-1]:
+            m = messages[-1]["context"]
+            state_info = m["state_info"]
+            action_str = get_action_description(
+                action,
+                state_info["info"]["observation_metadata"],
+                action_set_tag=self.action_set_tag,
+                prompt_constructor=self.prompt_constructor,
+            )
+            return {"content": action_str, "context": action}
+        return {"content": "", "context": action}
 
 
 def test(
@@ -278,58 +422,91 @@ def test(
             logger.info(f"[Intent]: {intent}")
 
             agent.reset(config_file)
-            trajectory: Trajectory = []
-            obs, info = env.reset(options={"config_file": config_file})
-            state_info: StateInfo = {"observation": obs, "info": info}
-            trajectory.append(state_info)
 
-            meta_data = {"action_history": ["None"]}
-            while True:
-                early_stop_flag, stop_info = early_stop(
-                    trajectory, max_steps, early_stop_thresholds
-                )
+            env_agent = EnvironmentAgent(
+                name="env_agent",
+                env=env,
+                config_file=config_file,
+                result_dir=args.result_dir,
+                action_set_tag=args.action_set_tag,
+                llm_config=False,
+                code_execution_config=False,
+            )
 
-                if early_stop_flag:
-                    action = create_stop_action(f"Early stop: {stop_info}")
-                else:
-                    try:
-                        action = agent.next_action(
-                            trajectory, intent, meta_data=meta_data
-                        )
-                    except ValueError as e:
-                        # get the error message
-                        action = create_stop_action(f"ERROR: {str(e)}")
+            config_list = autogen.config_list_from_json(
+                "OAI_CONFIG_LIST",
+                filter_dict={"model": ["gpt-4"]},
+            )
 
-                trajectory.append(action)
+            action_agent = autogen.AssistantAgent(
+                "action_agent",
+                llm_config={"config_list": config_list, "cache_seed": 32},
+                system_message="",
+            )
 
-                action_str = get_action_description(
-                    action,
-                    state_info["info"]["observation_metadata"],
-                    action_set_tag=args.action_set_tag,
-                    prompt_constructor=agent.prompt_constructor
-                    if isinstance(agent, PromptAgent)
-                    else None,
-                )
-                render_helper.render(
-                    action, state_info, meta_data, args.render_screenshot
-                )
-                meta_data["action_history"].append(action_str)
+            action_taking_capability = ActionTakingCapability(
+                prompt_constructor=agent.prompt_constructor,
+                action_set_tag=args.action_set_tag,
+                max_retry=args.max_retry,
+            )
 
-                if action["action_type"] == ActionTypes.STOP:
-                    break
+            action_taking_capability.add_to_agent(action_agent)
 
-                obs, _, terminated, _, info = env.step(action)
-                state_info = {"observation": obs, "info": info}
-                trajectory.append(state_info)
+            env_agent.initiate_chat(
+                action_agent,
+                message={
+                    "content": {"intent": intent},
+                },
+            )
 
-                if terminated:
-                    # add a action place holder
-                    trajectory.append(create_stop_action(""))
-                    break
+            # while True:
+            #     early_stop_flag, stop_info = early_stop(
+            #         trajectory, max_steps, early_stop_thresholds
+            #     )
+
+            #     if early_stop_flag:
+            #         action = create_stop_action(f"Early stop: {stop_info}")
+            #     else:
+            #         try:
+            #             action = agent.next_action(
+            #                 trajectory, intent, meta_data=meta_data
+            #             )
+            #         except ValueError as e:
+            #             # get the error message
+            #             action = create_stop_action(f"ERROR: {str(e)}")
+
+            #     trajectory.append(action)
+
+            #     action_str = get_action_description(
+            #         action,
+            #         state_info["info"]["observation_metadata"],
+            #         action_set_tag=args.action_set_tag,
+            #         prompt_constructor=(
+            #             agent.prompt_constructor
+            #             if isinstance(agent, PromptAgent)
+            #             else None
+            #         ),
+            #     )
+            #     render_helper.render(
+            #         action, state_info, meta_data, args.render_screenshot
+            #     )
+            #     meta_data["action_history"].append(action_str)
+
+            #     if action["action_type"] == ActionTypes.STOP:
+            #         break
+
+            #     obs, _, terminated, _, info = env.step(action)
+            #     state_info = {"observation": obs, "info": info}
+            #     trajectory.append(state_info)
+
+            #     if terminated:
+            #         # add a action place holder
+            #         trajectory.append(create_stop_action(""))
+            #         break
 
             evaluator = evaluator_router(config_file)
             score = evaluator(
-                trajectory=trajectory,
+                trajectory=env_agent.trajectory,
                 config_file=config_file,
                 page=env.page,
                 client=env.get_page_client(env.page),
@@ -343,11 +520,9 @@ def test(
                 logger.info(f"[Result] (FAIL) {config_file}")
 
             if args.save_trace_enabled:
-                env.save_trace(
-                    Path(args.result_dir) / "traces" / f"{task_id}.zip"
-                )
+                env.save_trace(Path(args.result_dir) / "traces" / f"{task_id}.zip")
 
-        except openai.error.OpenAIError as e:
+        except openai.OpenAIError as e:
             logger.info(f"[OpenAI Error] {repr(e)}")
         except Exception as e:
             logger.info(f"[Unhandled Error] {repr(e)}]")
@@ -362,7 +537,8 @@ def test(
         render_helper.close()
 
     env.close()
-    logger.info(f"Average score: {sum(scores) / len(scores)}")
+    if len(scores) > 0:
+        logger.info(f"Average score: {sum(scores) / len(scores)}")
 
 
 def prepare(args: argparse.Namespace) -> None:
@@ -374,9 +550,7 @@ def prepare(args: argparse.Namespace) -> None:
     # prepare result dir
     result_dir = args.result_dir
     if not result_dir:
-        result_dir = (
-            f"cache/results_{time.strftime('%Y%m%d%H%M%S', time.localtime())}"
-        )
+        result_dir = f"cache/results_{time.strftime('%Y%m%d%H%M%S', time.localtime())}"
     if not Path(result_dir).exists():
         Path(result_dir).mkdir(parents=True, exist_ok=True)
         args.result_dir = result_dir
@@ -392,9 +566,7 @@ def prepare(args: argparse.Namespace) -> None:
 
 def get_unfinished(config_files: list[str], result_dir: str) -> list[str]:
     result_files = glob.glob(f"{result_dir}/*.html")
-    task_ids = [
-        os.path.basename(f).split(".")[0].split("_")[1] for f in result_files
-    ]
+    task_ids = [os.path.basename(f).split(".")[0].split("_")[1] for f in result_files]
     unfinished_configs = []
     for config_file in config_files:
         task_id = os.path.basename(config_file).split(".")[0]
@@ -411,6 +583,7 @@ def dump_config(args: argparse.Namespace) -> None:
             logger.info(f"Dump config to {config_file}")
 
 
+# def run():
 if __name__ == "__main__":
     args = config()
     args.sleep_after_execution = 2.0
