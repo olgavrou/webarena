@@ -9,24 +9,24 @@ WIKIPEDIA = os.environ.get("WIKIPEDIA", "")
 MAP = os.environ.get("MAP", "")
 HOMEPAGE = os.environ.get("HOMEPAGE", "")
 
-assert (
-    REDDIT
-    and SHOPPING
-    and SHOPPING_ADMIN
-    and GITLAB
-    and WIKIPEDIA
-    and MAP
-    and HOMEPAGE
-), (
-    f"Please setup the URLs to each site. Current: \n"
-    + f"Reddit: {REDDIT}\n"
-    + f"Shopping: {SHOPPING}\n"
-    + f"Shopping Admin: {SHOPPING_ADMIN}\n"
-    + f"Gitlab: {GITLAB}\n"
-    + f"Wikipedia: {WIKIPEDIA}\n"
-    + f"Map: {MAP}\n"
-    + f"Homepage: {HOMEPAGE}\n"
-)
+# assert (
+#     REDDIT
+#     and SHOPPING
+#     and SHOPPING_ADMIN
+#     and GITLAB
+#     and WIKIPEDIA
+#     and MAP
+#     and HOMEPAGE
+# ), (
+#     f"Please setup the URLs to each site. Current: \n"
+#     + f"Reddit: {REDDIT}\n"
+#     + f"Shopping: {SHOPPING}\n"
+#     + f"Shopping Admin: {SHOPPING_ADMIN}\n"
+#     + f"Gitlab: {GITLAB}\n"
+#     + f"Wikipedia: {WIKIPEDIA}\n"
+#     + f"Map: {MAP}\n"
+#     + f"Homepage: {HOMEPAGE}\n"
+# )
 
 
 ACCOUNTS = {
@@ -42,10 +42,10 @@ ACCOUNTS = {
 
 URL_MAPPINGS = {
     REDDIT: "http://reddit.com",
-    SHOPPING: "http://onestopmarket.com",
-    SHOPPING_ADMIN: "http://luma.com/admin",
-    GITLAB: "http://gitlab.com",
-    WIKIPEDIA: "http://wikipedia.org",
-    MAP: "http://openstreetmap.org",
-    HOMEPAGE: "http://homepage.com",
+    # SHOPPING: "http://onestopmarket.com",
+    # SHOPPING_ADMIN: "http://luma.com/admin",
+    # GITLAB: "http://gitlab.com",
+    # WIKIPEDIA: "http://wikipedia.org",
+    # MAP: "http://openstreetmap.org",
+    # HOMEPAGE: "http://homepage.com",
 }
